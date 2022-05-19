@@ -3,59 +3,89 @@ package noise;
 import javafx.animation.AnimationTimer;
 import javafx.application.Application;
 import javafx.scene.Scene;
-import javafx.scene.canvas.Canvas;
-import javafx.scene.image.PixelWriter;
+import javafx.scene.image.*;
 import javafx.scene.layout.Pane;
-import javafx.scene.paint.Color;
+import javafx.scene.layout.VBox;
 import javafx.stage.Stage;
+
+import java.nio.IntBuffer;
+import java.util.concurrent.CyclicBarrier;
 
 /**
  * Makes a colorful window displaying 3 layers of noise combined together as red green and blue values
  * for each pixel and rounded off to a set number of sections. Each distinct color or section can be
  * labeled as a distinct biome. This can serve as the base to further biome generation specialized to
- * each individual color region. There is also an option to move through the z axis to get a cool
- * morphing animation of changing color which can be the base to some really cool art.
+ * each individual color region. The program moves through the z axis to get a cool morphing animation
+ * of changing color which can be the base to some really cool art as well as allowing biomes to change
+ * vertically which could be used to make biomes in a cave system.
+ *
+ * The program is parallelized using each thread to update the pixels on a horizontal section of the
+ * screen. A cyclicBarrier is used to stop any one row from getting ahead of the rest and causing the
+ * animation to go out of sync
  *
  * @author Benjamin Vick
  */
 public class BiomeMapVisualizer extends Application{
-
     public static void main(String[] args) {
         launch(args);
     }
 
     private Scene scene;
-    private PixelWriter pw;
     private final OpenSimplexNoise noise = new OpenSimplexNoise();
+
+    private CyclicBarrier barrier;
+    private boolean running = true;
+    private boolean update = false;
 
     @Override
     public void start(Stage stage) {
         Pane root = new Pane();
-        // if you want a smooth animation you will want these two values low
-        scene = new Scene(root, 500, 300);
+        // research needs to be done into pixel buffers since certain
+        // width/height values cause parts of the scene to not be covered.
+        // It could also be a calculation of mine going wrong though
+        // this did not happen in previous instances before the buffer
+        scene = new Scene(root, 1000, 604);
         stage.setScene(scene);
         stage.setTitle("Biome Map");
 
-        Canvas canvas = new Canvas(root.getWidth(), root.getHeight());
-        pw = canvas.getGraphicsContext2D().getPixelWriter();
-        root.getChildren().add(canvas);
+        VBox col = new VBox();
+        root.getChildren().add(col);
 
-        generate(0);
+        int numThreads = 4;
+        PixelBuffer<IntBuffer> buffers[] = new PixelBuffer[numThreads];
+        barrier = new CyclicBarrier(numThreads, () -> {
+            update = true;
+            while(!update);
+        });
 
-        AnimationTimer at = new AnimationTimer() {
-            double offset = 0; // starting z position for the map
-            @Override
-            public void handle(long now) {
-                generate(offset);
-                offset += 0.03;// move the z position a little bit every time the map is completed
+        for (int i = 0; i < numThreads; i++) {
+            int width = (int)scene.getWidth(), height = (int)scene.getHeight() / numThreads;
+            IntBuffer buffer = IntBuffer.allocate(width * height);
+            buffers[i] = new PixelBuffer<>(width, height, buffer, PixelFormat.getIntArgbPreInstance());
+            WritableImage image = new WritableImage(buffers[i]);
+            col.getChildren().add(new ImageView(image));
+            new SectionThread(i, buffers[i], width, height).start();
+        }
+
+        stage.setOnCloseRequest(e -> {
+            running = false;
+        });
+
+        new AnimationTimer() {
+            public void handle(long currentTime) {
+                if(update) {
+                    for (int i = 0; i < numThreads; i++) {
+                        buffers[i].updateBuffer(b -> null);
+                    }
+                    update = false;
+                }
             }
-        };
-        at.start(); // shows a continuous animation of the map moving through the z axis.
+        }.start();
 
         stage.show();
     }
 
-    private void generate(double offset) {
+    private void generate(double offset, int start, PixelBuffer<IntBuffer> pixelBuffer, int width, int height) {
         // The rate at which each new octave changes in effect to the total value.
         // You want this < 1 and > 0 for a biome map since you want finer details to have a smaller effect.
         double roughness = 0.35f;
@@ -77,21 +107,20 @@ public class BiomeMapVisualizer extends Application{
         // equal sized sections and equal frequency you will need to squish the values inward so the extremes
         // become as common as the average values. You can use this to your advantage to make rarer biomes or
         // code it out by squishing the values closer with a more complex function.
-        double sections = 5;
+        double sections = 4;
         --sections; // This is for 0 based indexing.
 
-        for (int y = 0; y < scene.getHeight(); y++) {
-            for (int x = 0; x < scene.getWidth(); x++) {
+        int[] array = pixelBuffer.getBuffer().array();
+        for (int y = start; y < start + height; y++) {
+            for (int x = 0; x < width; x++) {
 
                 // scale values from -1 through 1 to 0 through 1
-                double red = octavedNoise(octaves, roughness, x * scale, y * scale, offset) + 1;
+                double red =   octavedNoise(octaves, roughness, x * scale, y * scale, offset) + 1;
                 double green = octavedNoise(octaves, roughness, x * scale, y * scale, offset + gap) + 1;
-                double blue = octavedNoise(octaves, roughness, x * scale, y * scale, offset + gap * 2) + 1;
-                red /= 2;
-                green /= 2;
-                blue /= 2;
+                double blue =  octavedNoise(octaves, roughness, x * scale, y * scale, offset + gap * 2) + 1;
 
-                /*
+
+                ///*
                 // Multiply out the values of each color so that there are as many whole numbers in the range as
                 // sections then round them to those values and divide back down to the 0-1 value range.
                 red = Math.round(red * (sections)) / sections;
@@ -99,7 +128,12 @@ public class BiomeMapVisualizer extends Application{
                 blue = Math.round(blue * (sections)) / sections;
                 //*/
 
-                pw.setColor(x, y, new Color(red, blue, green, 1));
+                red *= 127.5;
+                green *= 127.5;
+                blue *= 127.5;
+
+                int color = 255 << 24 | (int)red << 16 | (int)green << 8 | (int)blue;
+                array[x % width + (y - start) * width] = color;
             }
         }
     }
@@ -133,6 +167,33 @@ public class BiomeMapVisualizer extends Application{
             octaveStrength *= roughness;
         }
         return val / max;
+    }
+
+    private class SectionThread extends Thread{
+        double offset = 0; // starting z position for the map
+        int num, start, width, height;
+        PixelBuffer<IntBuffer> buffer;
+
+        public SectionThread(int num, PixelBuffer<IntBuffer> buffer, int width, int height) {
+            this.num = num;
+            this.buffer = buffer;
+            this.width = width;
+            this.height = height;
+            start = num * height;
+        }
+
+        @Override
+        public void run() {
+            while(running) {
+                generate(offset, start, buffer, width, height);
+                offset += 0.02;// move the z position a little bit every time the map is completed
+                try {
+                    barrier.await();
+                }catch (Exception e){
+                    e.printStackTrace();
+                }
+            }
+        }
     }
 }
 
